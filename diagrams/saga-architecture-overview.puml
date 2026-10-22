@@ -1,0 +1,106 @@
+@startuml saga-architecture-overview
+' Visão geral: microsserviços, bancos independentes e barramento de mensageria
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam ArrowColor #444444
+skinparam ArrowThickness 1.2
+skinparam componentStyle rectangle
+skinparam rectangle {
+  BorderColor #555555
+  FontStyle bold
+}
+skinparam component {
+  BorderColor #555555
+  BackgroundColor #FFFFFF
+}
+skinparam database {
+  BorderColor #555555
+  BackgroundColor #FAFAFA
+}
+skinparam queue {
+  BorderColor #B36B00
+  BackgroundColor #FFF8EC
+}
+skinparam nodesep 40
+skinparam ranksep 55
+
+title Saga Orquestrada — Visão Geral da Arquitetura do Fluxo de Compra
+
+actor "Cliente\n(Web / App)" as client
+rectangle "API Gateway" as gw #EEF2F7
+
+rectangle "Order Service" as os #E8F1FB {
+  component "Order API\n(REST)" as oapi
+  component "Saga Orchestrator\n(CreateOrderSaga)" as orch #D5E8FA
+  component "Timeout Sweeper\n(job agendado)" as sweeper
+  component "Outbox Relay" as orelay
+  database "Order DB\n--\norders\nsaga_instance\noutbox\nprocessed_messages" as odb
+}
+
+rectangle "Message Broker (RabbitMQ — quorum queues)" as mb #FFF4E0 {
+  queue "inventory.commands" as qinv
+  queue "payment.commands" as qpay
+  queue "saga.replies" as qrep
+  queue "~*.dlq\n(dead-letter queues)" as qdlq #F9D9D9
+}
+
+rectangle "Inventory Service" as is #E9F6EC {
+  component "Command Handler\n(Idempotent Consumer)" as ih
+  component "Outbox Relay" as irelay
+  database "Inventory DB\n--\nstock\nreservations (TTL)\noutbox\nprocessed_messages" as idb
+}
+
+rectangle "Payment Service" as ps #F3ECF9 {
+  component "Command Handler\n(Idempotent Consumer)" as ph
+  component "Gateway Adapter\n(Timeout + Retry +\nCircuit Breaker)" as padapter
+  component "Outbox Relay" as prelay
+  database "Payment DB\n--\npayments\noutbox\nprocessed_messages" as pdb
+}
+
+cloud "Gateway de Pagamento\n(externo)" as ext #FFFFFF
+
+' --- Síncrono (HTTP) ---
+client --> gw : HTTPS
+gw --> oapi : POST /orders\nIdempotency-Key
+oapi --> orch : inicia saga
+orch --> odb : estado da saga +\noutbox (tx local)
+sweeper --> odb : step_deadline\nvencido?
+orelay --> odb : lê outbox
+
+' --- Assíncrono (comandos) ---
+orelay -[#B36B00,bold]-> qinv : ReserveStock\nReleaseStock\nConfirmReservation
+orelay -[#B36B00,bold]-> qpay : ProcessPayment\nGetPaymentStatus\nVoidPayment
+qinv -[#B36B00,bold]-> ih
+qpay -[#B36B00,bold]-> ph
+
+ih --> idb : tx local
+irelay --> idb
+ph --> pdb : tx local
+ph --> padapter
+prelay --> pdb
+padapter --> ext : HTTPS\nIdempotency-Key = sagaId
+
+' --- Assíncrono (respostas) ---
+irelay -[#2E7D32,bold]-> qrep : StockReserved / StockRejected\nStockReleased / ReservationConfirmed
+prelay -[#2E7D32,bold]-> qrep : PaymentApproved\nPaymentRejected / PaymentVoided
+qrep -[#2E7D32,bold]-> orch
+
+' --- Dead-letter ---
+qinv .[#C62828].> qdlq : esgotou retries /\nmensagem inválida
+qpay .[#C62828].> qdlq
+qrep .[#C62828].> qdlq
+
+legend right
+  |= Linha |= Significado |
+  | <color:#444444>——</color> | chamada síncrona / acesso local |
+  | <color:#B36B00>——</color> | comando assíncrono (orquestrador → participante) |
+  | <color:#2E7D32>——</color> | resposta assíncrona (participante → orquestrador) |
+  | <color:#C62828>- - -</color> | encaminhamento para dead-letter queue |
+  Cada serviço tem banco próprio (database per service).
+  Escrita de estado + publicação de mensagem são atômicas
+  via Transactional Outbox.
+endlegend
+@enduml

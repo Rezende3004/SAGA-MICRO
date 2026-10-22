@@ -1,0 +1,80 @@
+@startuml sequence-timeout-flow
+' Complementar: timeout de rede no passo de pagamento (resultado ambíguo)
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+  ArrowColor #444444
+  LifeLineBorderColor #999999
+  ParticipantBorderColor #555555
+  ParticipantBackgroundColor #FFFFFF
+  BoxBorderColor #BBBBBB
+  DividerBackgroundColor #EEF2F7
+  DividerBorderColor #BBBBBB
+}
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #C9B458
+}
+autonumber "<b>[00]"
+
+title Tratamento de Timeout — resposta do pagamento não chega
+
+box "Order Service" #E8F1FB
+  participant "Timeout\nSweeper" as TS
+  participant "Saga\nOrchestrator" as SO
+  database "Order DB" as ODB
+end box
+queue "Message\nBroker" as MB #FFF4E0
+box "Payment Service" #F3ECF9
+  participant "Payment" as PAY
+end box
+participant "Gateway\nExterno" as EXT
+
+SO ->> MB : ProcessPayment {sagaId}\n(step_deadline = now + 30s)
+MB ->> PAY : entrega
+PAY -[#C62828]->x EXT : POST /charges (Idempotency-Key: sagaId)\n<color:#C62828>timeout de rede — resultado DESCONHECIDO</color>
+note over SO : nenhum reply até o step_deadline
+
+== Detecção ==
+TS -> ODB : SELECT * FROM saga_instance\n WHERE step_deadline < now()\n   AND state NOT IN (COMPLETED, COMPENSATED, ...)\n FOR UPDATE SKIP LOCKED
+TS -> SO : onTimeout(sagaId, step=PROCESSING_PAYMENT)
+SO -> ODB : state → VERIFYING_PAYMENT, attempt_count++
+note right of SO
+  Não compensar "às cegas":
+  o cliente pode ter sido cobrado.
+  Primeiro **consultar** o status.
+end note
+
+== Reconciliação ==
+SO ->> MB : GetPaymentStatus {sagaId}
+MB ->> PAY : entrega
+PAY -> EXT : GET /charges?idempotency_key=sagaId
+
+alt cobrança encontrada e APROVADA
+  PAY ->> MB : PaymentApproved
+  MB ->> SO : saga.replies
+  SO -> ODB : state → CONFIRMING (segue fluxo de sucesso)
+else cobrança RECUSADA ou inexistente
+  PAY ->> MB : PaymentRejected
+  MB ->> SO : saga.replies
+  SO -> ODB : state → COMPENSATING (ReleaseStock → CancelOrder)
+else status continua desconhecido após 3 consultas
+  SO ->> MB : <color:#C62828>**VoidPayment**</color> {sagaId}
+  MB ->> PAY : entrega
+  PAY -> EXT : POST /charges/void (Idempotency-Key: sagaId)
+  PAY ->> MB : PaymentVoided
+  MB ->> SO : saga.replies
+  SO -> ODB : state → COMPENSATING (ReleaseStock → CancelOrder)
+end
+
+note over SO, EXT
+  **Resposta tardia**: se um PaymentApproved antigo chegar com a saga já em
+  COMPENSATING/COMPENSATED, a guarda de estado (WHERE state=? AND version=?)
+  rejeita a transição e o orquestrador emite **RefundPayment** — nunca reabre a saga.
+end note
+@enduml

@@ -1,0 +1,61 @@
+@startuml saga-state-machine
+' Máquina de estados persistida em saga_instance.state
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam roundCorner 12
+skinparam ArrowColor #444444
+skinparam state {
+  BorderColor #555555
+  BackgroundColor #FFFFFF
+  BackgroundColor<<ok>> #E9F6EC
+  BackgroundColor<<comp>> #FDECEC
+  BackgroundColor<<fail>> #F9D0D0
+  BackgroundColor<<pivot>> #F3ECF9
+}
+
+hide empty description
+title Máquina de Estados da Saga CreateOrder (tabela saga_instance)
+
+[*] --> RESERVING_STOCK : POST /orders\n(order=PENDING)
+
+RESERVING_STOCK --> PROCESSING_PAYMENT : StockReserved
+RESERVING_STOCK --> REJECTING_ORDER : StockRejected\n(sem estoque)
+RESERVING_STOCK --> RESERVING_STOCK : timeout\n(reenvia ReserveStock, ≤ 3x)
+RESERVING_STOCK --> COMPENSATING : timeout esgotado
+
+state PROCESSING_PAYMENT <<pivot>>
+PROCESSING_PAYMENT --> CONFIRMING : PaymentApproved
+PROCESSING_PAYMENT --> COMPENSATING : PaymentRejected
+PROCESSING_PAYMENT --> VERIFYING_PAYMENT : timeout
+
+VERIFYING_PAYMENT --> CONFIRMING : status = APPROVED
+VERIFYING_PAYMENT --> COMPENSATING : status = REJECTED /\ninexistente / PaymentVoided
+
+state CONFIRMING <<ok>>
+CONFIRMING --> CONFIRMING : falha/timeout\n(retry infinito c/ backoff)
+CONFIRMING --> COMPLETED : ReservationConfirmed\n(order=APPROVED)
+
+state COMPENSATING <<comp>>
+COMPENSATING --> REJECTING_ORDER : StockReleased
+COMPENSATING --> COMPENSATING : falha\n(retry c/ backoff, ≤ 10x)
+COMPENSATING --> COMPENSATION_FAILED : retries esgotados\n(DLQ + alerta)
+
+state REJECTING_ORDER <<comp>>
+REJECTING_ORDER --> COMPENSATED : CancelOrder\n(order=REJECTED)
+
+state COMPLETED <<ok>>
+state COMPENSATED <<comp>>
+state COMPENSATION_FAILED <<fail>>
+
+COMPLETED --> [*]
+COMPENSATED --> [*]
+COMPENSATION_FAILED --> COMPENSATING : reprocessamento\nmanual da DLQ
+
+note right of PROCESSING_PAYMENT
+  Transação pivô:
+  antes dela tudo é compensável;
+  depois dela tudo é retentável.
+end note
+@enduml

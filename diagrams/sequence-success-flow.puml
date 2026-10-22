@@ -1,0 +1,102 @@
+@startuml sequence-success-flow
+' Fluxo feliz da saga CreateOrder (orquestração)
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+  ArrowColor #444444
+  LifeLineBorderColor #999999
+  ParticipantBorderColor #555555
+  ParticipantBackgroundColor #FFFFFF
+  BoxBorderColor #BBBBBB
+  DividerBackgroundColor #EEF2F7
+  DividerBorderColor #BBBBBB
+}
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #C9B458
+}
+autonumber "<b>[00]"
+
+title Fluxo de Sucesso — Saga CreateOrder (Orquestração)
+
+actor "Cliente" as C
+participant "API Gateway" as GW
+box "Order Service" #E8F1FB
+  participant "Order API" as OA
+  participant "Saga\nOrchestrator" as SO
+  database "Order DB" as ODB
+end box
+queue "Message\nBroker" as MB #FFF4E0
+box "Inventory Service" #E9F6EC
+  participant "Inventory" as INV
+  database "Inventory DB" as IDB
+end box
+box "Payment Service" #F3ECF9
+  participant "Payment" as PAY
+  database "Payment DB" as PDB
+end box
+participant "Gateway\nExterno" as EXT
+
+== T1 — Criar pedido (síncrono, compensável por CancelOrder) ==
+C -> GW : POST /orders {itens, meioPagamento}\nIdempotency-Key: k-123
+GW -> OA : encaminha
+OA -> ODB : BEGIN\n INSERT orders (status=PENDING)\n INSERT saga_instance (state=RESERVING_STOCK,\n   step_deadline=now+10s)\n INSERT outbox [ReserveStock]\nCOMMIT
+note right of ODB
+  PENDING funciona como
+  **semantic lock**: nenhuma
+  outra operação trata o pedido
+  como definitivo
+end note
+OA --> GW : 202 Accepted {orderId, status: PENDING}
+GW --> C : 202 Accepted
+
+== T2 — Reservar estoque (assíncrono, compensável por ReleaseStock) ==
+SO ->> MB : ReserveStock {sagaId, orderId, itens, messageId}
+MB ->> INV : entrega (at-least-once)
+INV -> IDB : BEGIN\n INSERT processed_messages (messageId)\n UPDATE stock (disponível -= qtd)\n INSERT reservations (status=RESERVED, expira em 15 min)\n INSERT outbox [StockReserved]\nCOMMIT
+INV ->> MB : StockReserved {sagaId, reservationId}
+MB ->> SO : saga.replies
+SO -> ODB : UPDATE saga_instance\n SET state=PROCESSING_PAYMENT, version=version+1\n WHERE saga_id=? AND state=RESERVING_STOCK AND version=?\nINSERT outbox [ProcessPayment]
+
+== T3 — Processar pagamento (transação PIVÔ) ==
+SO ->> MB : ProcessPayment {sagaId, orderId, valor, messageId}
+MB ->> PAY : entrega
+PAY -> PDB : BEGIN\n INSERT processed_messages (messageId)\n INSERT payments (status=PROCESSING)\nCOMMIT
+PAY -> EXT : POST /charges\nIdempotency-Key: sagaId\n(timeout 5s, circuit breaker)
+EXT --> PAY : 200 APPROVED {transactionId}
+PAY -> PDB : BEGIN\n UPDATE payments (status=APPROVED)\n INSERT outbox [PaymentApproved]\nCOMMIT
+note right of PDB
+  **Pivô**: após o pagamento
+  aprovado a saga não volta
+  mais — só avança
+end note
+PAY ->> MB : PaymentApproved {sagaId, transactionId}
+MB ->> SO : saga.replies
+
+== T4 / T5 — Confirmar (transações retentáveis, nunca compensadas) ==
+SO -> ODB : UPDATE saga_instance SET state=CONFIRMING\nINSERT outbox [ConfirmReservation]
+SO ->> MB : ConfirmReservation {sagaId, reservationId}
+MB ->> INV : entrega
+INV -> IDB : reservations.status=CONFIRMED\n(baixa definitiva do estoque)
+INV ->> MB : ReservationConfirmed {sagaId}
+MB ->> SO : saga.replies
+SO -> ODB : BEGIN\n UPDATE orders SET status=APPROVED\n UPDATE saga_instance SET state=COMPLETED\n INSERT outbox [OrderApproved]\nCOMMIT
+
+== Consulta do resultado ==
+C -> GW : GET /orders/{orderId}\n(polling ou notificação via webhook/WebSocket)
+GW -> OA : encaminha
+OA --> C : 200 {status: APPROVED}
+
+legend right
+  |= Seta |= Significado |
+  | ——> | chamada síncrona (HTTP / acesso ao banco) |
+  | ——>> | mensagem assíncrona via broker |
+  Toda escrita de estado + mensagem de saída ocorre
+  na **mesma transação local** (Transactional Outbox).
+endlegend
+@enduml

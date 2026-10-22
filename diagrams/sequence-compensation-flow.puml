@@ -1,0 +1,118 @@
+@startuml sequence-compensation-flow
+' Pagamento recusado após a reserva de estoque -> compensações em ordem inversa
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+  ArrowColor #444444
+  LifeLineBorderColor #999999
+  ParticipantBorderColor #555555
+  ParticipantBackgroundColor #FFFFFF
+  BoxBorderColor #BBBBBB
+  DividerBackgroundColor #EEF2F7
+  DividerBorderColor #BBBBBB
+  GroupBorderColor #C62828
+  GroupBackgroundColor #FDECEC
+}
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #C9B458
+}
+autonumber "<b>[00]"
+
+title Fluxo de Falha e Compensação — Pagamento recusado após reserva de estoque
+
+actor "Cliente" as C
+participant "API Gateway" as GW
+box "Order Service" #E8F1FB
+  participant "Order API" as OA
+  participant "Saga\nOrchestrator" as SO
+  database "Order DB" as ODB
+end box
+queue "Message\nBroker" as MB #FFF4E0
+box "Inventory Service" #E9F6EC
+  participant "Inventory" as INV
+  database "Inventory DB" as IDB
+end box
+box "Payment Service" #F3ECF9
+  participant "Payment" as PAY
+  database "Payment DB" as PDB
+end box
+participant "Gateway\nExterno" as EXT
+
+== T1 + T2 — Pedido criado e estoque reservado (igual ao fluxo de sucesso) ==
+C -> GW : POST /orders\nIdempotency-Key: k-456
+GW -> OA : encaminha
+OA -> ODB : INSERT orders (PENDING)\nINSERT saga_instance (RESERVING_STOCK)\nINSERT outbox [ReserveStock]
+OA --> C : 202 Accepted {orderId, status: PENDING}
+SO ->> MB : ReserveStock {sagaId, itens}
+MB ->> INV : entrega
+INV -> IDB : stock -= qtd\nINSERT reservations (RESERVED)
+INV ->> MB : StockReserved {sagaId, reservationId}
+MB ->> SO : saga.replies
+SO -> ODB : saga_instance → PROCESSING_PAYMENT\nINSERT outbox [ProcessPayment]
+
+== T3 — Pagamento RECUSADO pelo gateway ==
+SO ->> MB : ProcessPayment {sagaId, valor}
+MB ->> PAY : entrega
+PAY -> PDB : INSERT processed_messages\nINSERT payments (PROCESSING)
+PAY -> EXT : POST /charges\nIdempotency-Key: sagaId
+EXT --> PAY : 402 DECLINED {reason: insufficient_funds}
+PAY -> PDB : BEGIN\n UPDATE payments (status=REJECTED)\n INSERT outbox [PaymentRejected]\nCOMMIT
+note right of PDB
+  Recusa de **negócio** ≠ falha técnica:
+  não há retry. Erros técnicos
+  (5xx, timeout) seguem a política
+  de retry + circuit breaker.
+end note
+PAY ->> MB : PaymentRejected {sagaId, reason}
+MB ->> SO : saga.replies
+
+== Compensações — executadas em ORDEM INVERSA (C2 → C1) ==
+SO -> ODB : UPDATE saga_instance\n SET state=COMPENSATING, version=version+1\n WHERE state=PROCESSING_PAYMENT AND version=?\nINSERT outbox [ReleaseStock]
+
+SO ->> MB : <color:#C62828>**ReleaseStock**</color> {sagaId, reservationId, messageId}
+MB ->> INV : entrega
+INV -> IDB : BEGIN\n INSERT processed_messages (messageId)\n UPDATE reservations SET status=RELEASED\n UPDATE stock (disponível += qtd)\n INSERT outbox [StockReleased]\nCOMMIT
+note right of IDB
+  **C2 — compensa T2**
+  Idempotente: reserva já liberada
+  ou inexistente ⇒ no-op que
+  responde StockReleased mesmo assim
+end note
+INV ->> MB : StockReleased {sagaId}
+MB ->> SO : saga.replies
+
+SO -> ODB : BEGIN\n UPDATE orders SET status=REJECTED,\n   reason=PAYMENT_DECLINED   <color:#C62828>**(CancelOrder)**</color>\n UPDATE saga_instance SET state=COMPENSATED\n INSERT outbox [OrderRejected]\nCOMMIT
+note right of ODB
+  **C1 — compensa T1** (local)
+  O pedido não é apagado: muda de
+  estado e mantém trilha de auditoria
+end note
+SO ->> MB : OrderRejected (evento de domínio → notificação ao cliente)
+
+C -> GW : GET /orders/{orderId}
+GW -> OA : encaminha
+OA --> C : 200 {status: REJECTED, reason: PAYMENT_DECLINED}
+
+group Se a compensação falhar (ex.: Inventory fora do ar)
+  SO ->> MB : ReleaseStock (retry — mesmo messageId)
+  note over SO, INV
+    Compensações precisam ser **retentáveis**: backoff exponencial
+    com jitter (1s, 2s, 4s… até 10 tentativas). Esgotado ⇒ mensagem vai
+    para <b>inventory.commands.dlq</b>, saga → COMPENSATION_FAILED e alerta
+    para a operação. Rede de segurança: a reserva expira sozinha (TTL 15 min).
+  end note
+end
+
+legend right
+  |= Seta |= Significado |
+  | ——> | chamada síncrona (HTTP / acesso ao banco) |
+  | ——>> | mensagem assíncrona via broker |
+  | <color:#C62828>vermelho</color> | transação compensatória |
+endlegend
+@enduml
